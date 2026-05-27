@@ -1,1 +1,103 @@
-# Pipeline to process STAP-seq
+# STAP-seq Pipeline
+
+This repo contains the working notes and lightweight processing scripts for
+Run202 STAP-seq data. Run202 also contains TAPS-seq files; those are deliberately
+excluded here. Every script discovers only files whose basename starts with
+`STAP_`.
+
+## Run202 Layout
+
+Raw data are available through the symlink:
+
+```bash
+../data/Run202 -> /gpfs/data/zhou-lab/dcai/data/Run202
+```
+
+There are two STAP library layouts in Run202:
+
+1. `STAP_TSS_*`: three FASTQs per sample, `R1/R2/R3`.
+2. `STAP_scTSSV2C_*`: two FASTQs per sample, `R1/R2`.
+
+The current scripts focus on `STAP_TSS_*`. The `STAP_scTSSV2C_*` files are
+inventoried but not processed by the TSS commands.
+
+## Processing Decision
+
+The `STAP_TSS_*` triplets are not all the same assay branch:
+
+- `STAP_TSS_500_oligos_*` and `STAP_TSS_6_oligos_*` match compact oligo design
+  FASTAs from the older lab analysis:
+  - `/gpfs/data/zhou-lab/dcai/059_DT/1_meCpG_STAP/data_500/data_500.fa`
+  - `/gpfs/data/zhou-lab/dcai/059_DT/1_meCpG_STAP/data_6/data_6.fa`
+- `STAP_TSS_27ac_*`, `STAP_TSS_BasPromoter_*`, and `STAP_TSS_SE_*` do not match
+  those oligo FASTAs by k-mer fingerprinting. They follow the older genomic
+  STAP TSS branch, where `R3` is mapped to hg38 with STAR.
+
+For the `STAP_TSS_*` triplets, the current read interpretation is:
+
+- `R1`: 8-bp RNA UMI followed by the TSS-starting sequence.
+- `R2`: 17-bp molecule/plasmid index. The first 3 bp encode methylation level,
+  followed by a 14-bp random barcode. The known methylation codes are `TTT`
+  100%, `AAA` 0%, `CAT` 60%, `AGT` 40%, `TGA` 20%, `TAG` 10%, `CTA` 1%, and
+  `ATG` 0.1%.
+- `R3`: paired from the opposite side toward R1. The oligo-control libraries
+  and `SE` contain the DNA barcode in this read.
+
+The shared hg38 STAR index exists at:
+
+```bash
+/gpfs/data/zhou-lab/dcai/data/hg38/STAR_index/STAR
+```
+
+The older V3 script used this annotation:
+
+```bash
+/gpfs/data/zhou-lab/dcai/data/hg38/gencode.v24.annotation.gtf
+```
+
+## Quick Start
+
+Create a STAP-only manifest:
+
+```bash
+python3 scripts/discover_stap_run.py \
+  --run-dir ../data/Run202 \
+  --out results/run202_stap_manifest.tsv
+```
+
+Quantify the oligo-control STAP TSS samples using the known design FASTAs:
+
+```bash
+python3 scripts/quantify_oligo_tss.py \
+  --sample STAP_TSS_500_oligos_S2 \
+  --run-dir ../data/Run202 \
+  --reference /gpfs/data/zhou-lab/dcai/059_DT/1_meCpG_STAP/data_500/data_500.fa \
+  --outdir results/oligo_tss \
+  --r2-orientation forward
+
+python3 scripts/quantify_oligo_tss.py \
+  --sample STAP_TSS_6_oligos_S1 \
+  --run-dir ../data/Run202 \
+  --reference /gpfs/data/zhou-lab/dcai/059_DT/1_meCpG_STAP/data_6/data_6.fa \
+  --outdir results/oligo_tss \
+  --r2-orientation forward
+```
+
+If the methylation code appears reverse-complemented, rerun with
+`--r2-orientation reverse-complement` and compare `unknown_methylation_code` in
+the per-sample `summary.tsv`.
+
+Generate, but do not run, STAR commands for genomic STAP TSS samples:
+
+```bash
+python3 scripts/write_star_commands.py \
+  --manifest results/run202_stap_manifest.tsv \
+  --out scripts/run202_stap_genomic_star.sh
+```
+
+Then run the generated shell script on a node where `STAR` is available.
+
+## Important Separation
+
+Do not process `TAPS_*` files with this repo. TAPS-seq has different chemistry
+and should get its own manifest and processing workflow.
