@@ -1,0 +1,22 @@
+name: stap-standard-tools
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11
+  - umi_tools=1.1.5
+  - fastp=0.23.4
+  - cutadapt=4.9
+  - bowtie2=2.5.4
+  - star=2.7.11b
+  - samtools=1.20
+  - bedtools=2.31.1
+  - deeptools=3.5.5
+  - ucsc-bedgraphtobigwig=472
+  - fastqc=0.12.1
+  - multiqc=1.25.1
+  - seqkit=2.8.2
+  - pigz=2.8
+  - gawk=5.3.0
+  - coreutils=9.5

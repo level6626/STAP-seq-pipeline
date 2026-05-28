@@ -10,6 +10,8 @@ position and methylation code.
 import argparse
 import csv
 import gzip
+import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -115,6 +117,50 @@ def write_tsv(path, rows, fields):
         writer.writerows(rows)
 
 
+def write_progress(path, sample, processed, summary, start_time):
+    elapsed = max(time.time() - start_time, 1e-6)
+    rows = [
+        {
+            "sample": sample,
+            "processed_reads": processed,
+            "assigned_reads": summary["assigned"],
+            "unassigned_reads": summary["unassigned"],
+            "unknown_methylation_code": summary["unknown_methylation_code"],
+            "elapsed_seconds": f"{elapsed:.1f}",
+            "reads_per_second": f"{processed / elapsed:.1f}",
+        }
+    ]
+    write_tsv(
+        path,
+        rows,
+        [
+            "sample",
+            "processed_reads",
+            "assigned_reads",
+            "unassigned_reads",
+            "unknown_methylation_code",
+            "elapsed_seconds",
+            "reads_per_second",
+        ],
+    )
+
+
+def report_progress(sample, processed, summary, start_time, progress_path):
+    elapsed = time.time() - start_time
+    rate = processed / elapsed if elapsed > 0 else 0.0
+    print(
+        (
+            f"{sample}: processed {processed:,} reads in {elapsed/60:.1f} min "
+            f"({rate:,.0f} reads/s); assigned={summary['assigned']:,}; "
+            f"unassigned={summary['unassigned']:,}; "
+            f"unknown_methylation={summary['unknown_methylation_code']:,}"
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+    write_progress(progress_path, sample, processed, summary, start_time)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample", required=True, help="Sample prefix without _R1/_R2/_R3")
@@ -128,6 +174,17 @@ def main():
         choices=["forward", "reverse-complement"],
         default="forward",
         help="Orientation used to parse the R2 methylation code and random barcode",
+    )
+    parser.add_argument(
+        "--write-assignments",
+        action="store_true",
+        help="Write one row per assigned read. This can be very large for full runs.",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=1_000_000,
+        help="Report progress every N read triplets; 0 disables progress messages",
     )
     parser.add_argument("--max-reads", type=int, default=0, help="Debug limit; 0 means all reads")
     args = parser.parse_args()
@@ -151,25 +208,31 @@ def main():
     raw_counts = Counter()
     umi_counts = defaultdict(set)
     summary = Counter()
+    start_time = time.time()
+    progress_path = outdir / "progress.tsv"
 
     assignment_path = outdir / "assignments.tsv.gz"
-    with gzip.open(assignment_path, "wt", newline="") as out_handle:
-        fields = [
-            "read_id",
-            "oligo_id",
-            "position",
-            "strand",
-            "support_read",
-            "r1_umi",
-            "r2_raw",
-            "r2_oriented",
-            "methylation_code",
-            "methylation_percent",
-            "r2_random_barcode",
-            "dedup_key",
-        ]
-        writer = csv.DictWriter(out_handle, delimiter="\t", fieldnames=fields)
+    assignment_handle = None
+    writer = None
+    fields = [
+        "read_id",
+        "oligo_id",
+        "position",
+        "strand",
+        "support_read",
+        "r1_umi",
+        "r2_raw",
+        "r2_oriented",
+        "methylation_code",
+        "methylation_percent",
+        "r2_random_barcode",
+        "dedup_key",
+    ]
+    if args.write_assignments:
+        assignment_handle = gzip.open(assignment_path, "wt", newline="")
+        writer = csv.DictWriter(assignment_handle, delimiter="\t", fieldnames=fields)
         writer.writeheader()
+    try:
         for i, ((id1, seq1, _), (id2, seq2, _), (id3, seq3, _)) in enumerate(
             zip(fastq_iter(r1), fastq_iter(r2), fastq_iter(r3)), start=1
         ):
@@ -178,6 +241,8 @@ def main():
             summary["total_reads"] += 1
             if id1 != id2 or id1 != id3:
                 summary["read_id_mismatch"] += 1
+                if args.progress_every and i % args.progress_every == 0:
+                    report_progress(args.sample, i, summary, start_time, progress_path)
                 continue
             hit = best_hit(seq1, index, args.kmer)
             support = "R1"
@@ -186,6 +251,8 @@ def main():
                 support = "R3"
             if hit is None:
                 summary["unassigned"] += 1
+                if args.progress_every and i % args.progress_every == 0:
+                    report_progress(args.sample, i, summary, start_time, progress_path)
                 continue
             oligo_id, strand, pos, _ = hit
             r1_umi = seq1[: args.r1_umi_length]
@@ -198,22 +265,29 @@ def main():
             raw_counts[key] += 1
             umi_counts[key].add(dedup_key)
             summary["assigned"] += 1
-            writer.writerow(
-                {
-                    "read_id": id1,
-                    "oligo_id": oligo_id,
-                    "position": pos,
-                    "strand": strand,
-                    "support_read": support,
-                    "r1_umi": r1_umi,
-                    "r2_raw": seq2,
-                    "r2_oriented": r2_info["r2_oriented"],
-                    "methylation_code": methylation_code,
-                    "methylation_percent": r2_info["methylation_percent"],
-                    "r2_random_barcode": r2_info["r2_random_barcode"],
-                    "dedup_key": dedup_key,
-                }
-            )
+            if writer:
+                writer.writerow(
+                    {
+                        "read_id": id1,
+                        "oligo_id": oligo_id,
+                        "position": pos,
+                        "strand": strand,
+                        "support_read": support,
+                        "r1_umi": r1_umi,
+                        "r2_raw": seq2,
+                        "r2_oriented": r2_info["r2_oriented"],
+                        "methylation_code": methylation_code,
+                        "methylation_percent": r2_info["methylation_percent"],
+                        "r2_random_barcode": r2_info["r2_random_barcode"],
+                        "dedup_key": dedup_key,
+                    }
+                )
+            if args.progress_every and i % args.progress_every == 0:
+                report_progress(args.sample, i, summary, start_time, progress_path)
+    finally:
+        if assignment_handle:
+            assignment_handle.close()
+    write_progress(progress_path, args.sample, summary["total_reads"], summary, start_time)
 
     count_rows = []
     for key in sorted(raw_counts):
@@ -250,7 +324,10 @@ def main():
         [
             {"metric": "reference_records", "value": len(records)},
             {"metric": "non_ambiguous_kmers", "value": len(index)},
-            {"metric": "assignment_file", "value": assignment_path},
+            {
+                "metric": "assignment_file",
+                "value": assignment_path if args.write_assignments else "not_written",
+            },
         ]
     )
     write_tsv(outdir / "summary.tsv", summary_rows, ["metric", "value"])

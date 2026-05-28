@@ -87,6 +87,35 @@ If the methylation code appears reverse-complemented, rerun with
 `--r2-orientation reverse-complement` and compare `unknown_methylation_code` in
 the per-sample `summary.tsv`.
 
+## Oligo Alignment And Counts
+
+`scripts/quantify_oligo_tss.py` does not use a genome aligner. The oligo
+references are short enough that the script uses exact k-mer matching:
+
+1. Load the design FASTA and build a non-ambiguous k-mer index from both strands.
+   The default k-mer length is 25 bp.
+2. For each read triplet, scan `R1` first, then `R3`, for the first exact k-mer
+   present in the design index.
+3. Convert the matching read offset and reference k-mer offset into a TSS
+   position on the oligo.
+4. Parse `R1[:8]` as the RNA UMI.
+5. Parse oriented `R2` as:
+   - `R2[:3]`: methylation code
+   - `R2[3:]`: 14-bp random plasmid/molecule barcode
+6. Count reads by `sample`, `oligo_id`, `position`, `strand`, and
+   `methylation_code`.
+
+Output columns in `tss_counts.tsv`:
+
+- `raw_count`: number of assigned read triplets in that bin.
+- `dedup_count`: number of unique molecule keys in that bin, where the molecule
+  key is `R1_UMI:R2_oriented`. This collapses reads with the same RNA UMI and
+  same 17-bp R2 molecule index.
+
+The script writes `summary.tsv` and `progress.tsv`. Per-read assignments are not
+written by default because full runs are large; add `--write-assignments` only
+when debugging individual reads.
+
 Generate, but do not run, STAR commands for genomic STAP TSS samples:
 
 ```bash
