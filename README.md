@@ -126,6 +126,232 @@ python3 scripts/write_star_commands.py \
 
 Then run the generated shell script on a node where `STAR` is available.
 
+## Standard-Tools Comparator Pipeline
+
+`scripts/standard_tools/run_stap_standard_tools.sh` is an independent
+comparator workflow built around common bioinformatics tools. It is intended for
+STAP TSS triplets only, not `TAPS_*` files.
+
+Workflow:
+
+1. Subset reads when `MAX_READS` is set, for smoke testing.
+2. Run `umi_tools extract` on `R1/R2`.
+   - Removes the 8-bp RNA UMI from the 5' end of `R1`.
+   - Appends the combined `R1_UMI + R2_17bp_barcode` to the read name.
+3. Synchronize `R3` headers to the UMI-tagged `R1` headers.
+   `umi_tools extract` is paired-end rather than triplet-aware, so this helper
+   keeps `R1/R3` paired-read names identical for Bowtie2/STAR and
+   `umi_tools dedup`.
+4. Trim adapters and low-quality bases with `fastp`.
+   The script does not enable 5' quality trimming, so the post-UMI first base of
+   `R1` remains the assayed TSS base.
+5. Align `R1/R3` with either:
+   - `ALIGNER=bowtie2` for reporter/plasmid/oligo references without splicing.
+   - `ALIGNER=star` for genome references where splicing is expected.
+6. Coordinate-sort and index the BAM with `samtools`.
+7. Deduplicate with `umi_tools dedup --paired`.
+8. Extract the 5'-most mapped position of read 1 into BED, then create
+   bedGraph and BigWig TSS coverage.
+9. Optionally count read1 TSS events over candidate windows with
+   `bedtools coverage -counts`.
+
+Small smoke test, using only the first 2,000 `STAP_TSS_500_oligos_S2` triplets:
+
+```bash
+srun --jobid=11320722 --pty bash
+source /gpfs/data/zhou-lab/yczhang/miniforge3/etc/profile.d/conda.sh
+conda activate stap-standard-tools
+cd /gpfs/data/zhou-lab/yczhang/methylation/STAP-seq-pipeline
+
+THREADS=4 \
+MAX_READS=2000 \
+SAMPLE=STAP_TSS_500_oligos_S2 \
+OUTDIR=results/standard_tools_smoke/STAP_TSS_500_oligos_S2 \
+ALIGNER=bowtie2 \
+REFERENCE_FASTA=/gpfs/data/zhou-lab/dcai/059_DT/1_meCpG_STAP/data_500/data_500.fa \
+scripts/standard_tools/run_stap_standard_tools.sh
+```
+
+Full Bowtie2 run template:
+
+```bash
+THREADS=16 \
+MAX_READS=0 \
+SAMPLE=STAP_TSS_500_oligos_S2 \
+OUTDIR=results/standard_tools/STAP_TSS_500_oligos_S2 \
+ALIGNER=bowtie2 \
+REFERENCE_FASTA=/gpfs/data/zhou-lab/dcai/059_DT/1_meCpG_STAP/data_500/data_500.fa \
+scripts/standard_tools/run_stap_standard_tools.sh
+```
+
+STAR/genome run template:
+
+```bash
+THREADS=16 \
+MAX_READS=0 \
+SAMPLE=STAP_TSS_27ac_rep1_S3 \
+OUTDIR=results/standard_tools/STAP_TSS_27ac_rep1_S3 \
+ALIGNER=star \
+STAR_INDEX_DIR=/gpfs/data/zhou-lab/dcai/data/hg38/STAR_index/STAR \
+CHROM_SIZES=/path/to/hg38.chrom.sizes \
+scripts/standard_tools/run_stap_standard_tools.sh
+```
+
+Candidate-window counting:
+
+```bash
+CANDIDATE_WINDOWS=/path/to/windows.bed \
+scripts/standard_tools/run_stap_standard_tools.sh
+```
+
+Main outputs:
+
+- `${SAMPLE}.${ALIGNER}.sorted.bam`: sorted, indexed alignment before UMI
+  deduplication.
+- `${SAMPLE}.${ALIGNER}.dedup.bam`: sorted, indexed alignment after
+  `umi_tools dedup`.
+- `${SAMPLE}.read1_tss.bed`: one deduplicated read1 TSS event per line.
+- `${SAMPLE}.read1_tss.bedGraph`: read1 TSS coverage.
+- `${SAMPLE}.read1_tss.bw`: BigWig version of the TSS coverage.
+- `logs/`: stdout/stderr for every tool step plus a progress log.
+
+By default, `DEDUP_WRITE_STATS=0` because `umi_tools 1.1.5 --output-stats` can
+fail with newer pandas releases. The environment file pins `pandas<2`; if your
+existing environment still has pandas 2.x, either keep the default or update it:
+
+```bash
+conda install -n stap-standard-tools 'pandas<2'
+```
+
+### Split Existing BAM By Methylation Code
+
+The merged standard-tools TSS BED/bedGraph/BigWig files combine all R2
+methylation codes. For STAP oligo/reporter data, split the existing aligned BAM
+afterward by parsing the first 3 bases of the R2 barcode embedded in the read
+name.
+
+For the full oligo500 run:
+
+```bash
+source /gpfs/data/zhou-lab/yczhang/miniforge3/etc/profile.d/conda.sh
+conda activate stap-standard-tools
+cd /gpfs/data/zhou-lab/yczhang/methylation/STAP-seq-pipeline
+
+THREADS=8 \
+SAMPLE=STAP_TSS_500_oligos_S2 \
+BAM=results/standard_tools/STAP_TSS_500_oligos_S2/STAP_TSS_500_oligos_S2.bowtie2.dedup.bam \
+OUTDIR=results/standard_tools/STAP_TSS_500_oligos_S2/methylation_split \
+CHROM_SIZES=results/standard_tools/STAP_TSS_500_oligos_S2/reference/chrom.sizes \
+scripts/standard_tools/split_methylation_from_bam.sh
+```
+
+This creates per-code BAM, BED, bedGraph, and BigWig files for:
+
+- `TTT_100pct`
+- `AAA_0pct`
+- `CAT_60pct`
+- `AGT_40pct`
+- `TGA_20pct`
+- `TAG_10pct`
+- `CTA_1pct`
+- `ATG_0p1pct`
+- `unknown`
+
+The parser assumes the read name suffix is `R1_UMI(8bp) + R2(17bp)`, which is
+what `run_stap_standard_tools.sh` writes. If you split a BAM generated with only
+the 17-bp R2 barcode in the read name, set `APPENDED_R1_UMI_LENGTH=0`.
+
+## Barcode-First Oligo Pipeline
+
+The current experiment-side interpretation for oligo/reporter STAP libraries is:
+
+- `R1`: 8-bp RNA UMI, followed immediately by the TSS-starting sequence.
+- `R2`: 3-bp methylation code, then 14-bp secondary random UMI.
+- `R3`: 5' DNA oligo barcode identifying the plasmid/oligo variant.
+- Oligo barcode dictionary:
+  `../data/meta/STAP_Seq_oligos.xlsx`.
+
+Use `scripts/barcode_pipeline/run_stap_barcode_pipeline.sh` for this workflow.
+It streams `R1/R2/R3` together, discards reads that do not match the methylation
+and oligo dictionaries, and writes tagged paired `R1/R3` FASTQs for alignment.
+
+The output read name format is SAM-safe:
+
+```text
+@OriginalReadName|METH=0.1%|OLIGO=NativeTSS:6749:CCATGCACAC_TTGTCAGTTATGTTAGGGGATA
+```
+
+The final underscore-delimited suffix is the 22-bp combined UMI:
+`R1_UMI(8 bp) + R2_secondary_UMI(14 bp)`. This lets `umi_tools dedup --paired`
+use the combined UMI natively. The `METH` and `OLIGO` tags are placed before the
+final underscore so Bowtie2 preserves them in the BAM query name.
+
+Small smoke test:
+
+```bash
+source /gpfs/data/zhou-lab/yczhang/miniforge3/etc/profile.d/conda.sh
+conda activate stap-standard-tools
+cd /gpfs/data/zhou-lab/yczhang/methylation/STAP-seq-pipeline
+
+THREADS=4 \
+MAX_READS=2000 \
+SAMPLE=STAP_TSS_500_oligos_S2 \
+OUTDIR=results/barcode_pipeline_smoke/STAP_TSS_500_oligos_S2 \
+REFERENCE_FASTA=/gpfs/data/zhou-lab/dcai/059_DT/1_meCpG_STAP/data_500/data_500.fa \
+BARCODE_ORIENTATION=both \
+BARCODE_SEARCH_BASES=0 \
+scripts/barcode_pipeline/run_stap_barcode_pipeline.sh
+```
+
+Full oligo500 template:
+
+```bash
+THREADS=16 \
+MAX_READS=0 \
+SAMPLE=STAP_TSS_500_oligos_S2 \
+OUTDIR=results/barcode_pipeline/STAP_TSS_500_oligos_S2 \
+REFERENCE_FASTA=/gpfs/data/zhou-lab/dcai/059_DT/1_meCpG_STAP/data_500/data_500.fa \
+BARCODE_ORIENTATION=both \
+BARCODE_SEARCH_BASES=0 \
+scripts/barcode_pipeline/run_stap_barcode_pipeline.sh
+```
+
+Full oligo6 template:
+
+```bash
+THREADS=8 \
+MAX_READS=0 \
+SAMPLE=STAP_TSS_6_oligos_S1 \
+OUTDIR=results/barcode_pipeline/STAP_TSS_6_oligos_S1 \
+REFERENCE_FASTA=/gpfs/data/zhou-lab/dcai/059_DT/1_meCpG_STAP/data_6/data_6.fa \
+BARCODE_ORIENTATION=both \
+BARCODE_SEARCH_BASES=0 \
+scripts/barcode_pipeline/run_stap_barcode_pipeline.sh
+```
+
+Important options:
+
+- `BARCODE_ORIENTATION=both`: test showed oligo500 R3 barcodes match the
+  reverse-complement of the Excel barcode at offset 0.
+- `MAX_BARCODE_MISMATCHES=1`: allows one barcode mismatch. Ambiguous one-mismatch
+  matches are discarded.
+- `BARCODE_SEARCH_BASES=0`: require the barcode at the first base of R3. Increase
+  this only if the barcode can be shifted downstream.
+- `KEEP_R3_BARCODE=1`: default behavior keeps the matched R3 barcode for
+  alignment. This mapped better in a 2,000-read oligo500 smoke test against
+  `data_500.fa`, which appears to include barcode sequence. Set to `0` only if
+  the Bowtie2 reference lacks the barcode sequence.
+
+Main outputs:
+
+- `${SAMPLE}.demux.stats.tsv`: demultiplexing and discard summary.
+- `${SAMPLE}.oligo_metadata.tsv`: loaded oligo metadata and generated `Oligo_ID`
+  values.
+- `${SAMPLE}.bowtie2.sorted.bam`: sorted alignment before UMI deduplication.
+- `${SAMPLE}.bowtie2.dedup.bam`: paired UMI-deduplicated BAM.
+- `${SAMPLE}.tss_by_oligo_meth.tsv`: final table with columns
+  `Oligo_ID`, `Meth_State`, `Chromosome`, `TSS_Position`, and `Count`.
+
 ## Important Separation
 
 Do not process `TAPS_*` files with this repo. TAPS-seq has different chemistry
