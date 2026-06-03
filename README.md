@@ -197,6 +197,61 @@ CHROM_SIZES=/path/to/hg38.chrom.sizes \
 scripts/standard_tools/run_stap_standard_tools.sh
 ```
 
+For large genome-wide libraries, `fastp` duplication-rate evaluation can use
+more memory than a small interactive allocation provides. The standard-tools
+script disables that optional calculation by default with
+`FASTP_EXTRA=--dont_eval_duplication`. This does not remove reads; PCR
+deduplication still happens later with `umi_tools dedup`.
+
+If a genome run was interrupted after UMI extraction, reuse the completed
+intermediate FASTQs instead of rebuilding them:
+
+```bash
+REUSE_UMI_FASTQS=1 \
+FASTP_EXTRA=--dont_eval_duplication \
+scripts/standard_tools/run_stap_standard_tools.sh
+```
+
+`run_star.sh` is configured this way for the existing
+`STAP_TSS_27ac_rep1_S3` recovery run. Start it on a compute node with enough
+memory for the hg38 STAR index and coordinate sorting, for example:
+
+```bash
+salloc --mem=96G --cpus-per-task=12
+bash run_star.sh
+```
+
+Trimmed FASTQs are now written to temporary filenames and renamed only after
+`fastp` succeeds, so interrupted output cannot be mistaken for a completed
+trimmed FASTQ.
+
+The older shared hg38 STAR index at
+`/gpfs/data/zhou-lab/dcai/data/hg38/STAR_index/STAR` was generated with an older
+STAR genome format and cannot be loaded by STAR `2.7.11b`. Build a compatible
+index once in the writable project data directory:
+
+```bash
+salloc --mem=96G --cpus-per-task=12
+source /gpfs/data/zhou-lab/yczhang/miniforge3/etc/profile.d/conda.sh
+conda activate stap-standard-tools
+cd /gpfs/data/zhou-lab/yczhang/methylation/STAP-seq-pipeline
+
+THREADS=12 scripts/reference/build_hg38_star_index.sh
+```
+
+The build script:
+
+1. Downloads UCSC `hg38.fa.gz`.
+2. Validates and decompresses the FASTA.
+3. Uses the existing shared `gencode.v24.annotation.gtf`.
+4. Generates `data/hg38/STAR_index_2.7.11b_gencode_v24`.
+
+`run_star.sh` points at that new index. After the one-time build completes, run:
+
+```bash
+bash run_star.sh
+```
+
 Candidate-window counting:
 
 ```bash

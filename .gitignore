@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 results/
 scripts/run202_stap_genomic_star.sh
+notebooks/intermediate_data/

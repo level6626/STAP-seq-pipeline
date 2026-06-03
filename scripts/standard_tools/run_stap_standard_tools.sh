@@ -26,6 +26,8 @@ CANDIDATE_WINDOWS="${CANDIDATE_WINDOWS:-}"
 MAX_READS="${MAX_READS:-0}"
 KEEP_INTERMEDIATES="${KEEP_INTERMEDIATES:-0}"
 DEDUP_WRITE_STATS="${DEDUP_WRITE_STATS:-0}"
+REUSE_UMI_FASTQS="${REUSE_UMI_FASTQS:-0}"
+FASTP_EXTRA="${FASTP_EXTRA:---dont_eval_duplication}"
 
 # R1 starts with 8 nt RNA UMI. R2 is the 17 nt molecule/plasmid barcode.
 R1_BC_PATTERN="${R1_BC_PATTERN:-NNNNNNNN}"
@@ -108,41 +110,55 @@ UMI_R1="${WORKDIR}/${SAMPLE}.R1.umi.fastq.gz"
 UMI_R2_DISCARD="${WORKDIR}/${SAMPLE}.R2.extracted.discard.fastq.gz"
 UMI_R3="${WORKDIR}/${SAMPLE}.R3.umi.fastq.gz"
 
-run_logged umi_extract_r1_r2 \
-    umi_tools extract \
-    --extract-method=string \
-    --bc-pattern="${R1_BC_PATTERN}" \
-    --bc-pattern2="${R2_BC_PATTERN}" \
-    -I "${INPUT_R1}" \
-    -S "${UMI_R1}" \
-    --read2-in="${INPUT_R2}" \
-    --read2-out="${UMI_R2_DISCARD}"
+if [[ "${REUSE_UMI_FASTQS}" == "1" || "${REUSE_UMI_FASTQS}" == "true" ]]; then
+    require_file "${UMI_R1}"
+    require_file "${UMI_R3}"
+    log_msg "Reusing existing UMI-extracted FASTQs"
+else
+    run_logged umi_extract_r1_r2 \
+        umi_tools extract \
+        --extract-method=string \
+        --bc-pattern="${R1_BC_PATTERN}" \
+        --bc-pattern2="${R2_BC_PATTERN}" \
+        -I "${INPUT_R1}" \
+        -S "${UMI_R1}" \
+        --read2-in="${INPUT_R2}" \
+        --read2-out="${UMI_R2_DISCARD}"
 
-run_logged sync_r3_umi_header \
-    python "${SCRIPT_DIR}/sync_fastq_headers.py" \
-    --template "${UMI_R1}" \
-    --sequences "${INPUT_R3}" \
-    --output "${UMI_R3}" \
-    --keep-sequence-comment
+    run_logged sync_r3_umi_header \
+        python "${SCRIPT_DIR}/sync_fastq_headers.py" \
+        --template "${UMI_R1}" \
+        --sequences "${INPUT_R3}" \
+        --output "${UMI_R3}" \
+        --keep-sequence-comment
 
-rm -f "${UMI_R2_DISCARD}"
+    rm -f "${UMI_R2_DISCARD}"
+fi
 file_report "${UMI_R1}" "${UMI_R3}"
 
 TRIM_R1="${WORKDIR}/${SAMPLE}.R1.umi.trim.fastq.gz"
 TRIM_R3="${WORKDIR}/${SAMPLE}.R3.umi.trim.fastq.gz"
+TRIM_R1_TMP="${TRIM_R1%.fastq.gz}.tmp.fastq.gz"
+TRIM_R3_TMP="${TRIM_R3%.fastq.gz}.tmp.fastq.gz"
+read -r -a FASTP_EXTRA_ARGS <<< "${FASTP_EXTRA}"
+rm -f "${TRIM_R1_TMP}" "${TRIM_R3_TMP}"
 
 run_logged fastp_trim \
     fastp \
     --thread "${THREADS}" \
     --in1 "${UMI_R1}" \
     --in2 "${UMI_R3}" \
-    --out1 "${TRIM_R1}" \
-    --out2 "${TRIM_R3}" \
+    --out1 "${TRIM_R1_TMP}" \
+    --out2 "${TRIM_R3_TMP}" \
     --detect_adapter_for_pe \
     --qualified_quality_phred 20 \
     --length_required 20 \
     --html "${LOGDIR}/${SAMPLE}.fastp.html" \
-    --json "${LOGDIR}/${SAMPLE}.fastp.json"
+    --json "${LOGDIR}/${SAMPLE}.fastp.json" \
+    "${FASTP_EXTRA_ARGS[@]}"
+
+mv -f "${TRIM_R1_TMP}" "${TRIM_R1}"
+mv -f "${TRIM_R3_TMP}" "${TRIM_R3}"
 
 file_report "${TRIM_R1}" "${TRIM_R3}"
 
