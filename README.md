@@ -1,9 +1,9 @@
 # STAP-seq Pipeline
 
 This repo contains the working notes and lightweight processing scripts for
-Run202 STAP-seq data. Run202 also contains TAPS-seq files; those are deliberately
-excluded here. Every script discovers only files whose basename starts with
-`STAP_`.
+Run202 STAP-seq and TAPS-seq data. The STAP discovery scripts still only
+discover files whose basename starts with `STAP_`; TAPS processing lives under
+`scripts/taps_pipeline`.
 
 ## Run202 Layout
 
@@ -43,10 +43,10 @@ For the `STAP_TSS_*` triplets, the current read interpretation is:
 - `R3`: paired from the opposite side toward R1. The oligo-control libraries
   and `SE` contain the DNA barcode in this read.
 
-The shared hg38 STAR index exists at:
+The STAR 2.7.11b-compatible hg38 index exists at:
 
 ```bash
-/gpfs/data/zhou-lab/dcai/data/hg38/STAR_index/STAR
+/gpfs/data/zhou-lab/yczhang/methylation/data/hg38/STAR_index_2.7.11b_gencode_v24
 ```
 
 The older V3 script used this annotation:
@@ -192,7 +192,7 @@ MAX_READS=0 \
 SAMPLE=STAP_TSS_27ac_rep1_S3 \
 OUTDIR=results/standard_tools/STAP_TSS_27ac_rep1_S3 \
 ALIGNER=star \
-STAR_INDEX_DIR=/gpfs/data/zhou-lab/dcai/data/hg38/STAR_index/STAR \
+STAR_INDEX_DIR=/gpfs/data/zhou-lab/yczhang/methylation/data/hg38/STAR_index_2.7.11b_gencode_v24 \
 CHROM_SIZES=/path/to/hg38.chrom.sizes \
 scripts/standard_tools/run_stap_standard_tools.sh
 ```
@@ -407,7 +407,283 @@ Main outputs:
 - `${SAMPLE}.tss_by_oligo_meth.tsv`: final table with columns
   `Oligo_ID`, `Meth_State`, `Chromosome`, `TSS_Position`, and `Count`.
 
-## Important Separation
+## TAPS Methylation Pipeline
 
-Do not process `TAPS_*` files with this repo. TAPS-seq has different chemistry
-and should get its own manifest and processing workflow.
+TAPS-seq is used here to estimate the real methylation level of each plasmid
+barcode. TAPS converts modified cytosines, 5mC/5hmC, to bases read as `T`,
+while unmodified `C` remains `C`. For a CpG, this means methylation is observed
+as `C>T` on the plus-strand CpG cytosine, or as `G>A` when the read covers the
+opposite strand.
+
+The pipeline carries the 17-bp R2 plasmid index into the alignment read name,
+aligns the assayed TAPS read, then counts CpG-level conversion grouped by the
+first 3 bp methylation code.
+
+Current interpretation:
+
+- `R2[:3]` after orientation is the expected methylation code:
+  `TTT` 100%, `AAA` 0%, `CAT` 60%, `AGT` 40%, `TGA` 20%, `TAG` 10%,
+  `CTA` 1%, and `ATG` 0.1%.
+- `R2[3:17]` is the plasmid/random barcode.
+- The emitted read name includes `METH_CODE=`, `METH_EXPECTED=`, `R2=`, and a
+  molecule `UMI=` made from the R1 UMI plus the oriented R2 barcode.
+- The CpG counter reports both plus-strand CpG `C>T` evidence and opposite
+  strand CpG `G>A` evidence.
+
+### TAPS Processing Steps
+
+The wrapper script is `scripts/taps_pipeline/run_taps_pipeline.sh`.
+
+1. Validate inputs:
+   - `R1`, `R2`, `R3` are discovered from `RUN_DIR` and `SAMPLE`.
+   - `REFERENCE_FASTA` must exist and is indexed with `samtools faidx` if needed.
+   - The default STAR index is the STAR `2.7.11b`-compatible hg38 index:
+     `/gpfs/data/zhou-lab/yczhang/methylation/data/hg38/STAR_index_2.7.11b_gencode_v24`.
+2. Parse and tag R2:
+   - `scripts/taps_pipeline/prepare_taps_fastqs.py` reads R1/R2/R3 triplets.
+   - It orients R2 using `R2_ORIENTATION`, default `forward`.
+   - It parses `R2[:3]` as `METH_CODE` and keeps the full `R2[:17]` barcode.
+   - It writes tagged R1/R3 FASTQs where the read name contains:
+     `METH_CODE=`, `METH_LABEL=`, `METH_EXPECTED=`, `R2=`, and `UMI=`.
+   - It writes `<sample>.prepare_taps.stats.tsv`; use this to verify that most
+     reads have valid methylation codes and that the chosen R2 orientation is
+     correct.
+3. Trim reads:
+   - `fastp` trims adapters/low-quality sequence on the tagged R1/R3 pair.
+   - The default `FASTP_EXTRA=--dont_eval_duplication` avoids high memory use
+     from optional fastp duplication-rate estimation.
+4. Align:
+   - Default genome-wide mode is `ALIGNER=star` and `ALIGN_READS=r3`.
+   - `R3` mode matches the older lab mapping branch and worked well for Run202
+     TAPS. The old STAR logs mapped `TAPS_27ac_rep1_S7` R3 at roughly 89%
+     unique mapping.
+   - `ALIGNER=bowtie2` is available for compact reporter/plasmid references.
+     Use this only when the reference FASTA really contains the assayed insert
+     sequence; a generic oligo workbook FASTA is useful for smoke testing but
+     is not expected to capture all genome-wide TAPS reads.
+5. Count CpG conversion:
+   - `scripts/taps_pipeline/count_taps_cpg_conversion.py` reads the tagged BAM
+     with `pysam`.
+   - At every aligned CpG position in `REFERENCE_FASTA`, it counts:
+     `converted`, `unconverted`, and `other`.
+   - Plus-strand CpG cytosine evidence is `C` unconverted and `T` converted.
+   - Opposite-strand CpG evidence is `G` unconverted and `A` converted.
+   - Counts are grouped by `METH_CODE`, genomic CpG coordinate, and observed
+     strand. The summary collapses over CpGs within each methylation code.
+
+### Run TAPS
+
+Build an optional compact reporter FASTA from the oligo workbook:
+
+```bash
+cd /gpfs/data/zhou-lab/yczhang/methylation/STAP-seq-pipeline
+
+/gpfs/data/zhou-lab/yczhang/miniforge3/envs/stap-standard-tools/bin/python \
+  scripts/taps_pipeline/write_reporter_fasta_from_oligos.py \
+  --oligo-xlsx ../data/meta/STAP_Seq_oligos.xlsx \
+  --out results/taps_pipeline/reference/STAP_Seq_oligos.reporter.fa
+```
+
+Smoke test the example sample on 2,000 reads:
+
+```bash
+THREADS=4 \
+MAX_READS=2000 \
+SAMPLE=TAPS_27ac_rep1_S7 \
+OUTDIR=results/taps_pipeline_smoke/TAPS_27ac_rep1_S7 \
+ALIGNER=bowtie2 \
+ALIGN_READS=r3 \
+REFERENCE_FASTA=results/taps_pipeline/reference/STAP_Seq_oligos.reporter.fa \
+R2_ORIENTATION=forward \
+scripts/taps_pipeline/run_taps_pipeline.sh
+```
+
+For the genome-wide 27ac TAPS run, use STAR on R3 to match the older lab
+mapping branch:
+
+```bash
+THREADS=12 \
+MAX_READS=0 \
+SAMPLE=TAPS_27ac_rep1_S7 \
+OUTDIR=results/taps_pipeline/TAPS_27ac_rep1_S7 \
+ALIGNER=star \
+ALIGN_READS=r3 \
+REFERENCE_FASTA=../data/hg38/hg38.fa \
+STAR_INDEX_DIR=/gpfs/data/zhou-lab/yczhang/methylation/data/hg38/STAR_index_2.7.11b_gencode_v24 \
+R2_ORIENTATION=forward \
+scripts/taps_pipeline/run_taps_pipeline.sh
+```
+
+For libraries where the old notebook removed R2 reads containing the plasmid
+motif `TCGGCCTATCATCTGGG`, run with:
+
+```bash
+FILTER_R2_MOTIF=TCGGCCTATCATCTGGG scripts/taps_pipeline/run_taps_pipeline.sh
+```
+
+### TAPS Output Files
+
+Main outputs:
+
+- `<sample>.prepare_taps.stats.tsv`: raw R2 parsing, methylation-code counts,
+  chosen R2 orientation counts, and read discard counts.
+- `<sample>.<aligner>.<mode>.sorted.bam`: coordinate-sorted tagged alignment.
+- `<sample>.taps_cpg_sites.tsv`: CpG-site conversion table.
+- `<sample>.taps_meth_code_summary.tsv`: expected vs observed conversion
+  summary for methylation-treatment QC.
+
+Important log files:
+
+- `logs/star_align.log`: exact STAR command and fatal alignment/index errors.
+- `logs/<sample>.STAR.Log.final.out`: STAR mapping summary.
+- `logs/fastp_trim.log`: fastp command and trimming status.
+- `logs/count_taps_cpg_conversion.log`: CpG-count command and completion status.
+
+### TAPS QC
+
+First check R2 parsing. The expected result is that most reads have one of the
+eight designed methylation codes and `r2_orientation_forward` dominates for
+Run202:
+
+```bash
+cat results/taps_pipeline/TAPS_27ac_rep1_S7/TAPS_27ac_rep1_S7.prepare_taps.stats.tsv
+```
+
+If many reads are under `discard_r2_unknown_meth_code`, rerun a small test with:
+
+```bash
+R2_ORIENTATION=reverse-complement MAX_READS=200000 scripts/taps_pipeline/run_taps_pipeline.sh
+```
+
+or:
+
+```bash
+R2_ORIENTATION=both MAX_READS=200000 scripts/taps_pipeline/run_taps_pipeline.sh
+```
+
+Then compare the orientation and unknown-code counts.
+
+Next check alignment:
+
+```bash
+cat results/taps_pipeline/TAPS_27ac_rep1_S7/logs/TAPS_27ac_rep1_S7.STAR.Log.final.out
+cat results/taps_pipeline/TAPS_27ac_rep1_S7/logs/flagstat_sorted.log
+```
+
+The default TAPS STAR run keeps unique alignments only
+(`--outFilterMultimapNmax 1`), so it cannot be used to estimate how many reads
+would have mapped to multiple loci. To audit whether methylation code affects
+unique versus multi mapping, rerun STAR while retaining multimappers:
+
+```bash
+cd STAP-seq-pipeline
+THREADS=16 \
+MAX_MULTIMAP=100 \
+SOURCE_OUTDIR=results/taps_pipeline/TAPS_27ac_rep1_S7 \
+OUTDIR=results/taps_pipeline/TAPS_27ac_rep1_S7_multimap_audit \
+scripts/taps_pipeline/run_taps_multimap_audit.sh
+```
+
+This reuses the existing tagged and trimmed R3 FASTQ from the full TAPS run,
+then writes:
+
+- `TAPS_27ac_rep1_S7.star.r3.multimap100.sorted.bam`: STAR alignment with
+  multimappers retained.
+- `TAPS_27ac_rep1_S7.mapping_by_meth_code.multimap100.tsv`: per-code mapping
+  table. Compare `AAA` and `TTT` using `unique_fraction_vs_input` and
+  `multi_fraction_among_bam_mapped`.
+- `logs/TAPS_27ac_rep1_S7.STAR.multimap.Log.final.out`: global STAR unique,
+  multiple-loci, and too-many-loci rates.
+
+For `TAPS_27ac_rep1_S7`, a very low STAR mapping rate usually means the wrong
+STAR index/reference is being used, or an old incompatible STAR index was used.
+STAR `2.7.11b` must use:
+
+```bash
+/gpfs/data/zhou-lab/yczhang/methylation/data/hg38/STAR_index_2.7.11b_gencode_v24
+```
+
+Finally check methylation calibration. `AAA` should be low conversion and `TTT`
+should be high conversion. Intermediate codes should generally be ordered by
+expected methylation, though local sequence context and coverage can make any
+single CpG noisy:
+
+```bash
+column -t results/taps_pipeline/TAPS_27ac_rep1_S7/TAPS_27ac_rep1_S7.taps_meth_code_summary.tsv | sed -n '1,12p'
+```
+
+Useful summary columns:
+
+- `expected_conversion`: expected in vitro methylation level from the 3-bp code.
+- `converted_count`: CpG observations read as TAPS-converted.
+- `unconverted_count`: CpG observations read as unconverted.
+- `callable_count`: `converted_count + unconverted_count`.
+- `conversion_rate`: observed TAPS conversion rate.
+
+For site-level QC, sort CpGs by coverage or inspect a specific methylation code:
+
+```bash
+sites=results/taps_pipeline/TAPS_27ac_rep1_S7/TAPS_27ac_rep1_S7.taps_cpg_sites.tsv
+head -n 1 "${sites}"
+awk 'BEGIN{FS=OFS="\t"} NR>1 && $1=="TTT"' "${sites}" \
+  | sort -t $'\t' -k11,11nr \
+  | sed -n '1,20p'
+```
+
+Interpretation:
+
+- Good R2 QC plus good STAR mapping but poor `TTT`/`AAA` separation suggests a
+  methylation/TAPS chemistry issue or a reference/read-orientation issue in the
+  CpG counter.
+- Poor R2 QC suggests the R2 orientation or read structure is wrong.
+- Poor mapping suggests the wrong alignment reference/index, adapter problems,
+  or that the assayed TAPS read is not represented by the selected reference.
+- Low STAP/TAPS barcode overlap after alignment should be compared with raw R2
+  overlap to separate biological/library overlap from alignment losses.
+
+## STAP/TAPS Barcode Overlap
+
+For matched STAP and TAPS libraries, compare overlap using the 17-bp R2 plasmid
+barcode, not the full STAP UMI suffix. In the standard STAP BAM, the final
+25-bp query-name suffix is `R1_UMI(8) + R2(17)`. In the TAPS BAM, the same
+plasmid barcode is stored as `R2=<17bp>`.
+
+Full barcode-overlap run:
+
+```bash
+/gpfs/data/zhou-lab/yczhang/miniforge3/envs/stap-standard-tools/bin/python \
+  scripts/compare_stap_taps_barcodes.py \
+  --stap-bam results/standard_tools/STAP_TSS_27ac_rep1_S3/STAP_TSS_27ac_rep1_S3.star.dedup.bam \
+  --taps-bam results/taps_pipeline/TAPS_27ac_rep1_S7/TAPS_27ac_rep1_S7.star.r3.sorted.bam \
+  --outdir results/barcode_overlap/STAP_TSS_27ac_rep1_S3__TAPS_27ac_rep1_S7 \
+  --min-mapq 0
+```
+
+Outputs:
+
+- `barcode_counts_stap.tsv`: STAP aligned-record and molecule counts per R2.
+- `barcode_counts_taps.tsv`: TAPS aligned-record and molecule counts per R2.
+- `barcode_overlap.tsv`: union table with STAP/TAPS presence and counts.
+- `barcode_overlap_summary.tsv`: overall and methylation-code-stratified overlap.
+
+To separate barcode-library overlap from alignment effects, compare raw R2 files
+directly:
+
+```bash
+/gpfs/data/zhou-lab/yczhang/miniforge3/envs/stap-standard-tools/bin/python \
+  scripts/compare_raw_r2_barcodes.py \
+  --stap-r2 ../data/Run202/STAP_TSS_27ac_rep1_S3_R2_001.fastq.gz \
+  --taps-r2 ../data/Run202/TAPS_27ac_rep1_S7_R2_001.fastq.gz \
+  --outdir results/raw_barcode_overlap/STAP_TSS_27ac_rep1_S3__TAPS_27ac_rep1_S7
+```
+
+Raw outputs mirror the alignment overlap outputs:
+
+- `raw_barcode_counts_stap.tsv`
+- `raw_barcode_counts_taps.tsv`
+- `raw_barcode_overlap.tsv`
+- `raw_barcode_overlap_summary.tsv`
+
+Add `--require-known-code` if you want to discard raw R2 reads whose first
+3 bp are not one of the eight designed methylation codes before calculating
+overlap.
