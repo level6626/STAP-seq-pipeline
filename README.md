@@ -630,6 +630,35 @@ awk 'BEGIN{FS=OFS="\t"} NR>1 && $1=="TTT"' "${sites}" \
   | sed -n '1,20p'
 ```
 
+To check non-CpG background conversion, count TAPS-like conversion at CpH
+contexts (`CpA`, `CpC`, and `CpT`). Plus-strand `C>T` and opposite-strand
+`G>A` are counted as converted:
+
+```bash
+cd STAP-seq-pipeline
+scripts/taps_pipeline/run_taps_noncpg_conversion.sh
+```
+
+The output is:
+
+```bash
+results/taps_pipeline/TAPS_27ac_rep1_S7/TAPS_27ac_rep1_S7.taps_noncpg_context_summary.tsv
+```
+
+For the main non-CpG rate by methylation code, inspect the combined `CpH`
+rows:
+
+```bash
+awk 'BEGIN{FS=OFS="\t"} NR==1 || ($4=="CpH" && $5=="both")' \
+  results/taps_pipeline/TAPS_27ac_rep1_S7/TAPS_27ac_rep1_S7.taps_noncpg_context_summary.tsv
+```
+
+To also include CpG rows as a direct baseline in the same table:
+
+```bash
+INCLUDE_CPG=1 scripts/taps_pipeline/run_taps_noncpg_conversion.sh
+```
+
 Interpretation:
 
 - Good R2 QC plus good STAR mapping but poor `TTT`/`AAA` separation suggests a
@@ -687,3 +716,107 @@ Raw outputs mirror the alignment overlap outputs:
 Add `--require-known-code` if you want to discard raw R2 reads whose first
 3 bp are not one of the eight designed methylation codes before calculating
 overlap.
+
+## EM-seq Methylation Pipeline
+
+Run188 custom EM-seq triplets are handled by
+`scripts/emseq_pipeline/run_emseq_pipeline.sh`. The preprocessing script streams
+the synchronized `R1/R2/R3` FASTQs in binary mode, trims the 8-bp R1 UMI from
+the emitted R1 by default, and writes paired `R1/R3` FASTQs for Bismark. The R2
+read is stored in the read name as metadata:
+
+- `R1[:8]`: UMI.
+- `R1[8:]`: genomic/TSS sequence aligned as read 1.
+- `R2[:2]`: EM methylation spike-in code:
+  `TT=0_pct`, `AA=100_pct`, `GG=40_pct`, `CC=10_pct`, `AT=1_pct`,
+  `TA=0.1_pct`; all other 2-bp codes are kept as `Unknown`.
+- `R2[2:]`: random plasmid barcode.
+- `R3`: reverse genomic mate aligned as read 2.
+
+The emitted read-name format keeps tags parseable and places the molecule UMI
+after the final underscore for `umi_tools dedup --extract-umi-method=read_id`:
+
+```text
+@Original|METH_CODE=CC|METH_LABEL=10_pct|R2=CCGACTGCTGCGTT|R2_BARCODE=GACTGCTGCGTT|UMI=TNGGTAACGACTGCTGCGTT|UMITOOLS_TNGGTAACGACTGCTGCGTT
+```
+
+By default, the molecule UMI is `R1_UMI + R2[2:]`. Override with
+`UMI_SOURCE=r1` or `UMI_SOURCE=r1+r2` if the deduplication key should be
+narrower or include the methylation code.
+
+Smoke test preprocessing and trimming only, useful before Bismark is installed:
+
+```bash
+source /gpfs/data/zhou-lab/yczhang/miniforge3/etc/profile.d/conda.sh
+conda activate stap-standard-tools
+cd /gpfs/data/zhou-lab/yczhang/methylation/STAP-seq-pipeline
+
+THREADS=2 \
+MAX_READS=2000 \
+RUN_BISMARK=0 \
+SAMPLE=EM_pSTAP_cell_27ac_S14 \
+OUTDIR=results/emseq_pipeline_smoke/EM_pSTAP_cell_27ac_S14 \
+scripts/emseq_pipeline/run_emseq_pipeline.sh
+```
+
+Full hg38 run template:
+
+```bash
+THREADS=12 \
+BISMARK_PARALLEL=2 \
+EXTRACTOR_PARALLEL=4 \
+MAX_READS=0 \
+SAMPLE=EM_pSTAP_cell_27ac_S14 \
+OUTDIR=results/emseq_pipeline/EM_pSTAP_cell_27ac_S14 \
+REFERENCE_FASTA=../data/hg38/hg38.fa \
+scripts/emseq_pipeline/run_emseq_pipeline.sh
+```
+
+The wrapper expects `bismark`, `bismark_genome_preparation`, and
+`bismark_methylation_extractor` in `${CONDA_ENV_BIN}` or in paths supplied with
+`BISMARK=`, `BISMARK_GENOME_PREPARATION=`, and
+`BISMARK_METHYLATION_EXTRACTOR=`. If
+`${BISMARK_GENOME_DIR}/Bisulfite_Genome` is missing and
+`BUILD_BISMARK_INDEX=auto` or `1`, it runs `bismark_genome_preparation` first.
+The existing standard Bowtie2 hg38 index in `../data/hg38/bowtie2_index` is not
+the same as a Bismark bisulfite genome index. `THREADS` is used for `fastp` and
+`samtools`; set `BISMARK_PARALLEL` and `EXTRACTOR_PARALLEL` separately because
+Bismark parallel jobs can consume multiple CPU threads each.
+
+If a run already completed preprocessing and `fastp`, resume from the trimmed
+FASTQs with:
+
+```bash
+REUSE_TRIMMED_FASTQS=1 \
+BUILD_BISMARK_INDEX=0 \
+scripts/emseq_pipeline/run_emseq_pipeline.sh
+```
+
+For Run188 EM samples whose name contains `500`, the wrapper automatically uses
+the compact oligo reference:
+
+```text
+/gpfs/data/zhou-lab/dcai/059_DT/1_meCpG_STAP/data_500/data_500.fa
+```
+
+For oligo500 runs, the wrapper also creates a right-padded local copy of the
+FASTA under `${OUTDIR}/reference/right_padded_oligo` and builds the Bismark
+index there. The original 250-bp oligo records end exactly where many R3 reads
+align, because the terminal 10 bp contain the oligo barcode. Bismark can report
+these as unique Bowtie2 hits and then discard them with
+`genomic sequence could not be extracted`; right-padding gives Bismark enough
+downstream context while preserving original 1-based oligo coordinates. Disable
+this with `PAD_OLIGO_REFERENCE=0` or adjust with `OLIGO_REFERENCE_RIGHT_PAD=`.
+
+EM-seq QC can be run after alignment with:
+
+```bash
+SAMPLE=EM_pSTAP_cell_500_S13 \
+OUTDIR=results/emseq_pipeline/EM_pSTAP_cell_500_S13_padded \
+scripts/emseq_pipeline/run_emseq_qc.sh
+```
+
+For oligo500 samples, QC also checks whether the mapped oligo's terminal barcode
+matches the R3/read2 barcode. The default barcode length is 10 bp and can be
+changed with `OLIGO_BARCODE_LENGTH=`. The non-CpG conversion table includes CpG
+rows as a baseline by default.
