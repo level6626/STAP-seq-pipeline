@@ -461,6 +461,10 @@ The wrapper script is `scripts/taps_pipeline/run_taps_pipeline.sh`.
      Use this only when the reference FASTA really contains the assayed insert
      sequence; a generic oligo workbook FASTA is useful for smoke testing but
      is not expected to capture all genome-wide TAPS reads.
+   - `ALIGNER=bismark` is available for bisulfite-style alignment against a
+     Bismark genome folder. It supports `ALIGN_READS=r3` and
+     `ALIGN_READS=paired`, then emits the same coordinate-sorted BAM interface
+     used by the CpG counter.
 5. Count CpG conversion:
    - `scripts/taps_pipeline/count_taps_cpg_conversion.py` reads the tagged BAM
      with `pysam`.
@@ -514,6 +518,54 @@ R2_ORIENTATION=forward \
 scripts/taps_pipeline/run_taps_pipeline.sh
 ```
 
+To align the same TAPS reads with Bismark instead, point `REFERENCE_FASTA` at
+the FASTA used to create the Bismark genome folder. If
+`${BISMARK_GENOME_DIR}/Bisulfite_Genome` is missing and
+`BUILD_BISMARK_INDEX=auto` or `1`, the wrapper runs
+`bismark_genome_preparation` first.
+
+Single-end R3 Bismark template:
+
+```bash
+THREADS=12 \
+MAX_READS=0 \
+SAMPLE=TAPS_27ac_rep1_S7 \
+OUTDIR=results/taps_pipeline/TAPS_27ac_rep1_S7_bismark_r3 \
+ALIGNER=bismark \
+ALIGN_READS=r3 \
+REFERENCE_FASTA=../data/hg38/hg38.fa \
+BISMARK_GENOME_DIR=../data/hg38 \
+BUILD_BISMARK_INDEX=auto \
+BISMARK_PARALLEL=2 \
+R2_ORIENTATION=forward \
+scripts/taps_pipeline/run_taps_pipeline.sh
+```
+
+Paired-end Bismark template:
+
+```bash
+THREADS=12 \
+MAX_READS=0 \
+SAMPLE=TAPS_27ac_rep1_S7 \
+OUTDIR=results/taps_pipeline/TAPS_27ac_rep1_S7_bismark_paired \
+ALIGNER=bismark \
+ALIGN_READS=paired \
+REFERENCE_FASTA=../data/hg38/hg38.fa \
+BISMARK_GENOME_DIR=../data/hg38 \
+BUILD_BISMARK_INDEX=0 \
+BISMARK_PARALLEL=2 \
+TRIM_R1_UMI=1 \
+R2_ORIENTATION=forward \
+scripts/taps_pipeline/run_taps_pipeline.sh
+```
+
+The wrapper expects `bismark` and `bismark_genome_preparation` in
+`${CONDA_ENV_BIN}` or in paths supplied with `BISMARK=` and
+`BISMARK_GENOME_PREPARATION=`. The ordinary Bowtie2 index prefix is not enough
+for Bismark; the genome folder must contain Bismark's `Bisulfite_Genome`
+directory. Use `BISMARK_EXTRA` for chemistry/library-specific flags such as
+`--non_directional`.
+
 For libraries where the old notebook removed R2 reads containing the plasmid
 motif `TCGGCCTATCATCTGGG`, run with:
 
@@ -536,6 +588,7 @@ Important log files:
 
 - `logs/star_align.log`: exact STAR command and fatal alignment/index errors.
 - `logs/<sample>.STAR.Log.final.out`: STAR mapping summary.
+- `logs/bismark_align.log`: exact Bismark command and alignment/index errors.
 - `logs/fastp_trim.log`: fastp command and trimming status.
 - `logs/count_taps_cpg_conversion.log`: CpG-count command and completion status.
 
@@ -716,6 +769,52 @@ Raw outputs mirror the alignment overlap outputs:
 Add `--require-known-code` if you want to discard raw R2 reads whose first
 3 bp are not one of the eight designed methylation codes before calculating
 overlap.
+
+## STAP/TAPS Read Association
+
+After confirming barcode overlap, associate aligned STAP RNA reads with aligned
+TAPS DNA reads that share the same 17-bp R2 barcode. This is the same join key
+used above: `methylation_code(3 bp) + plasmid_barcode(14 bp)`.
+
+Small capped smoke test:
+
+```bash
+/gpfs/data/zhou-lab/yczhang/miniforge3/envs/stap-standard-tools/bin/python \
+  scripts/associate_stap_taps_reads.py \
+  --stap-bam results/standard_tools/STAP_TSS_27ac_rep1_S3/STAP_TSS_27ac_rep1_S3.star.dedup.bam \
+  --taps-bam results/taps_pipeline/TAPS_27ac_rep1_S7_paired_bowtie2/TAPS_27ac_rep1_S7.bowtie2.paired.sorted.bam \
+  --outdir results/stap_taps_association_smoke/STAP_TSS_27ac_rep1_S3__TAPS_27ac_rep1_S7_paired_bowtie2 \
+  --max-stap-records 600000 \
+  --max-taps-records 450000 \
+  --max-associations 1000
+```
+
+Full run template:
+
+```bash
+/gpfs/data/zhou-lab/yczhang/miniforge3/envs/stap-standard-tools/bin/python \
+  scripts/associate_stap_taps_reads.py \
+  --stap-bam results/standard_tools/STAP_TSS_27ac_rep1_S3/STAP_TSS_27ac_rep1_S3.star.dedup.bam \
+  --taps-bam results/taps_pipeline/TAPS_27ac_rep1_S7_paired_bowtie2/TAPS_27ac_rep1_S7.bowtie2.paired.sorted.bam \
+  --outdir results/stap_taps_association/STAP_TSS_27ac_rep1_S3__TAPS_27ac_rep1_S7_paired_bowtie2
+```
+
+Default behavior:
+
+- Uses primary, non-duplicate, mapped alignments with `MAPQ >= 0`.
+- Associates `read1` records only, to avoid double-counting paired mates.
+- Keeps only the eight known 3-bp methylation codes unless
+  `--include-unknown-meth-code` is set.
+- Uses a temporary SQLite database in the output directory and removes it when
+  complete. Add `--keep-sqlite` to retain it for debugging.
+
+Outputs:
+
+- `stap_taps_read_associations.tsv.gz`: STAP/TAPS read-pair associations.
+- `barcode_association_summary.tsv`: per-barcode STAP counts, TAPS counts, and
+  possible association-row counts.
+- `associate_stap_taps_reads.summary.tsv`: parser/filter metrics and run
+  parameters.
 
 ## EM-seq Methylation Pipeline
 

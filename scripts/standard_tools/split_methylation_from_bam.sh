@@ -15,6 +15,7 @@ CANDIDATE_WINDOWS="${CANDIDATE_WINDOWS:-}"
 # code is the first 3 bases of R2, so it starts after the 8-bp R1 UMI.
 APPENDED_R1_UMI_LENGTH="${APPENDED_R1_UMI_LENGTH:-8}"
 INCLUDE_UNKNOWN="${INCLUDE_UNKNOWN:-1}"
+REQUIRE_BIGWIG="${REQUIRE_BIGWIG:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOGDIR="${OUTDIR}/logs"
@@ -60,8 +61,23 @@ require_file() {
     fi
 }
 
+require_command() {
+    local name="$1"
+    if ! command -v "${name}" >/dev/null 2>&1; then
+        echo "Required command is not available in PATH: ${name}" >&2
+        exit 1
+    fi
+}
+
 require_file "${BAM}"
 require_file "${CHROM_SIZES}"
+require_command samtools
+require_command gawk
+require_command sort
+require_command bedtools
+if [[ "${REQUIRE_BIGWIG}" == "1" || "${REQUIRE_BIGWIG}" == "true" ]]; then
+    require_command bedGraphToBigWig
+fi
 
 MAP_TSV="${OUTDIR}/methylation_code_outputs.tsv"
 cat >"${MAP_TSV}" <<EOF
@@ -161,6 +177,8 @@ tail -n +2 "${MAP_TSV}" | while IFS=$'\t' read -r code label split_bam; do
 
     if [[ -s "${tss_bedgraph}" ]] && command -v bedGraphToBigWig >/dev/null 2>&1; then
         run_logged "tss_bigwig_${suffix}" bedGraphToBigWig "${tss_bedgraph}" "${CHROM_SIZES}" "${tss_bw}"
+    elif [[ "${REQUIRE_BIGWIG}" == "1" || "${REQUIRE_BIGWIG}" == "true" ]]; then
+        log_msg "SKIP  tss_bigwig_${suffix}: ${tss_bedgraph} is empty, so no BigWig was created"
     fi
 
     if [[ -n "${CANDIDATE_WINDOWS}" ]]; then

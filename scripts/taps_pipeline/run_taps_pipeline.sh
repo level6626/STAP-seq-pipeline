@@ -19,6 +19,10 @@ STAR_EXTRA="${STAR_EXTRA:---outFilterMultimapNmax 1 --outFilterMismatchNmax 10 -
 BOWTIE2_INDEX_PREFIX="${BOWTIE2_INDEX_PREFIX:-${OUTDIR}/reference/bowtie2_index/reference}"
 BOWTIE2_EXTRA="${BOWTIE2_EXTRA:---end-to-end --very-sensitive}"
 BUILD_BOWTIE2_INDEX="${BUILD_BOWTIE2_INDEX:-auto}"
+BISMARK_GENOME_DIR="${BISMARK_GENOME_DIR:-}"
+BISMARK_EXTRA="${BISMARK_EXTRA:-}"
+BISMARK_PARALLEL="${BISMARK_PARALLEL:-1}"
+BUILD_BISMARK_INDEX="${BUILD_BISMARK_INDEX:-auto}"
 
 MAX_READS="${MAX_READS:-0}"
 R2_ORIENTATION="${R2_ORIENTATION:-forward}"
@@ -33,6 +37,8 @@ FASTP="${FASTP:-${CONDA_ENV_BIN}/fastp}"
 STAR="${STAR:-${CONDA_ENV_BIN}/STAR}"
 BOWTIE2="${BOWTIE2:-${CONDA_ENV_BIN}/bowtie2}"
 BOWTIE2_BUILD="${BOWTIE2_BUILD:-${CONDA_ENV_BIN}/bowtie2-build}"
+BISMARK="${BISMARK:-${CONDA_ENV_BIN}/bismark}"
+BISMARK_GENOME_PREPARATION="${BISMARK_GENOME_PREPARATION:-${CONDA_ENV_BIN}/bismark_genome_preparation}"
 SAMTOOLS="${SAMTOOLS:-${CONDA_ENV_BIN}/samtools}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -75,6 +81,11 @@ run_bash_logged() {
 require_file() {
     local path="$1"
     [[ -s "${path}" ]] || { echo "Required file is missing or empty: ${path}" >&2; exit 1; }
+}
+
+require_executable() {
+    local path="$1"
+    [[ -x "${path}" ]] || { echo "Required executable is missing: ${path}" >&2; exit 1; }
 }
 
 require_file "${R1}"
@@ -169,8 +180,83 @@ elif [[ "${ALIGNER}" == "bowtie2" ]]; then
         echo "ALIGN_READS must be r3 or paired." >&2
         exit 1
     fi
+elif [[ "${ALIGNER}" == "bismark" ]]; then
+    require_executable "${BISMARK}"
+    require_executable "${BISMARK_GENOME_PREPARATION}"
+    require_executable "${BOWTIE2}"
+    require_executable "${SAMTOOLS}"
+
+    if [[ "${ALIGN_READS}" != "r3" && "${ALIGN_READS}" != "paired" ]]; then
+        echo "ALIGN_READS must be r3 or paired." >&2
+        exit 1
+    fi
+
+    if [[ -z "${BISMARK_GENOME_DIR}" ]]; then
+        ref_dir="$(cd "$(dirname "${REFERENCE_FASTA}")" && pwd)"
+        ref_base="$(basename "${REFERENCE_FASTA}")"
+        if [[ -d "${ref_dir}/Bisulfite_Genome" || -w "${ref_dir}" ]]; then
+            BISMARK_GENOME_DIR="${ref_dir}"
+        else
+            BISMARK_GENOME_DIR="${OUTDIR}/reference/bismark_genome"
+            mkdir -p "${BISMARK_GENOME_DIR}"
+            ln -sf "${ref_dir}/${ref_base}" "${BISMARK_GENOME_DIR}/${ref_base}"
+        fi
+    fi
+    mkdir -p "${BISMARK_GENOME_DIR}"
+
+    if [[ ! -e "${BISMARK_GENOME_DIR}/$(basename "${REFERENCE_FASTA}")" ]]; then
+        ln -sf "$(cd "$(dirname "${REFERENCE_FASTA}")" && pwd)/$(basename "${REFERENCE_FASTA}")" \
+            "${BISMARK_GENOME_DIR}/$(basename "${REFERENCE_FASTA}")"
+    fi
+
+    if [[ "${BUILD_BISMARK_INDEX}" == "1" || "${BUILD_BISMARK_INDEX}" == "true" || "${BUILD_BISMARK_INDEX}" == "auto" ]]; then
+        if [[ ! -s "${BISMARK_GENOME_DIR}/Bisulfite_Genome/CT_conversion/BS_CT.1.bt2" && ! -s "${BISMARK_GENOME_DIR}/Bisulfite_Genome/CT_conversion/BS_CT.1.bt2l" ]]; then
+            run_logged bismark_genome_preparation \
+                "${BISMARK_GENOME_PREPARATION}" \
+                --bowtie2 \
+                --path_to_aligner "$(dirname "${BOWTIE2}")" \
+                "${BISMARK_GENOME_DIR}"
+        fi
+    fi
+
+    BISMARK_DIR="${OUTDIR}/bismark"
+    mkdir -p "${BISMARK_DIR}"
+    BISMARK_ARGS=(
+        "${BISMARK}"
+        --genome "${BISMARK_GENOME_DIR}"
+        --output_dir "${BISMARK_DIR}"
+        --path_to_bowtie2 "$(dirname "${BOWTIE2}")"
+        --samtools_path "$(dirname "${SAMTOOLS}")"
+    )
+    if [[ "${BISMARK_PARALLEL}" == "1" ]]; then
+        BISMARK_ARGS+=(--basename "${SAMPLE}.${ALIGN_READS}")
+    else
+        log_msg "BISMARK_PARALLEL=${BISMARK_PARALLEL}; omitting --basename because Bismark rejects --basename with multicore mode"
+        BISMARK_ARGS+=(--parallel "${BISMARK_PARALLEL}")
+    fi
+    if [[ -n "${BISMARK_EXTRA}" ]]; then
+        # shellcheck disable=SC2206
+        BISMARK_EXTRA_ARGS=(${BISMARK_EXTRA})
+        BISMARK_ARGS+=("${BISMARK_EXTRA_ARGS[@]}")
+    fi
+    if [[ "${ALIGN_READS}" == "paired" ]]; then
+        BISMARK_ARGS+=(-1 "${TRIM_R1}" -2 "${TRIM_R3}")
+    else
+        BISMARK_ARGS+=("${TRIM_R3}")
+    fi
+    run_logged bismark_align "${BISMARK_ARGS[@]}"
+
+    shopt -s nullglob
+    BISMARK_BAM_CANDIDATES=("${BISMARK_DIR}"/*.bam)
+    shopt -u nullglob
+    if [[ ${#BISMARK_BAM_CANDIDATES[@]} -ne 1 || ! -s "${BISMARK_BAM_CANDIDATES[0]}" ]]; then
+        echo "Expected exactly one Bismark BAM in ${BISMARK_DIR}, found ${#BISMARK_BAM_CANDIDATES[@]}" >&2
+        printf 'Candidate: %s\n' "${BISMARK_BAM_CANDIDATES[@]}" >&2
+        exit 1
+    fi
+    run_logged sort_bismark_bam "${SAMTOOLS}" sort -@ "${THREADS}" -o "${SORTED_BAM}" "${BISMARK_BAM_CANDIDATES[0]}"
 else
-    echo "ALIGNER must be star or bowtie2." >&2
+    echo "ALIGNER must be star, bowtie2, or bismark." >&2
     exit 1
 fi
 

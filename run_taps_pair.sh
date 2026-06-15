@@ -1,6 +1,9 @@
 THREADS=12 \
-SAMPLE=TAPS_27ac_rep1_S7 \
-OUTDIR=results/taps_pipeline/TAPS_27ac_rep1_S7_paired_bowtie2 \
+SAMPLE=TAPS_BasPromoter_S10 \
+R1=../data/Run202/TAPS_BasPromoter_S10_R1_001.filter.fastq.gz \
+R2=../data/Run202/TAPS_BasPromoter_S10_R2_001.filter.fastq.gz \
+R3=../data/Run202/TAPS_BasPromoter_S10_R3_001.filter.fastq.gz \
+OUTDIR=results/taps_pipeline/TAPS_BasPromoter_S10_paired_bowtie2 \
 ALIGNER=bowtie2 \
 ALIGN_READS=paired \
 REFERENCE_FASTA=../data/hg38/hg38.fa \
